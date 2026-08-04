@@ -39,6 +39,94 @@ read the ad. Focus entirely on the targeting inference itself. If the
 targeting looks broad/undifferentiated rather than personal, say so plainly
 rather than inventing a narrower reason.`;
 
+// Strict JSON Schema for Mistral's json_schema response_format mode.
+// This enforces exact keys and enum values at the source — the model
+// cannot invent demographic keys or arbitrary targeting_type strings.
+const ANALYSIS_RESPONSE_SCHEMA = {
+  type: "object",
+  properties: {
+    brand: { type: ["string", "null"] },
+    targeting_type: {
+      anyOf: [
+        { type: "string", enum: ["interest","demographic","geographic","retargeting","lookalike","professional","platform_internal","broad_undifferentiated"] },
+        { type: "null" },
+      ],
+    },
+    interests: { type: "array", items: { type: "string" } },
+    demographics: {
+      type: "object",
+      properties: {
+        age_bracket: { anyOf: [{ type: "string", enum: ["18-24","25-34","35-44","45-54","55-64","65+","unknown"] }, { type: "null" }] },
+        gender: { anyOf: [{ type: "string", enum: ["all","male","female","non-binary","unknown"] }, { type: "null" }] },
+        location: { anyOf: [{ type: "string", enum: ["US","UK","CA","AU","Uganda","India","EU","global","unknown"] }, { type: "null" }] },
+        income_level: { anyOf: [{ type: "string", enum: ["low","low-to-middle","middle","upper-middle","high","unknown"] }, { type: "null" }] },
+        occupation: { anyOf: [{ type: "array", items: { enum: ["professional","business owner","student","family","self-employed","IT","manager","unknown"] } }, { type: "null" }] },
+      },
+      additionalProperties: false,
+    },
+    likely_reason: { type: "string" },
+  },
+  required: ["brand", "targeting_type", "interests", "demographics", "likely_reason"],
+  additionalProperties: false,
+} as const;
+
+// Safety-net normalizers (the strict JSON Schema should prevent drift,
+// but these catch edge cases and normalize legacy data in raw_ai_analysis).
+function normalizeInterests(interests: string[]): string[] {
+  return Array.from(new Set(
+    (interests ?? []).map((i) => i.toLowerCase().replace(/_/g, " ").trim()).filter(Boolean)
+  ));
+}
+
+// Map any free-text targeting string to the canonical enum.
+// Unknown values default to "broad_undifferentiated".
+function normalizeTargetingType(t: string | null | undefined): string | null {
+  if (!t) return null;
+  const m: Record<string, string> = {
+    "interest-based": "interest",
+    "interest_and_demographic_based": "interest",
+    interest: "interest",
+    demographic: "demographic",
+    geographic: "geographic",
+    "geo-based and interest-based": "geographic",
+    "geo-based": "geographic",
+    retargeting: "retargeting",
+    platform_retargeting: "platform_internal",
+    "platform internal": "platform_internal",
+    lookalike: "lookalike",
+    "broad interest + lookalike": "lookalike",
+    broad_undifferentiated: "broad_undifferentiated",
+    broad: "broad_undifferentiated",
+    professional: "professional",
+    "professional/employment-based": "professional",
+  };
+  return m[t.toLowerCase().trim()] ?? "broad_undifferentiated";
+}
+
+// Normalize demographics: map legacy keys (age_range, income, etc.) to
+// canonical keys. Buckets age if free-text age was produced.
+function normalizeDemographics(d: Record<string, unknown>): Record<string, unknown> {
+  const age = d.age ?? d.age_range ?? d.age_bracket ?? null;
+  return {
+    age_bracket: age ? bucketAge(age as string) : null,
+    gender: d.gender ?? null,
+    location: d.location ?? null,
+    income_level: d.income_level ?? d.income ?? null,
+    occupation: Array.isArray(d.occupation) ? d.occupation : d.occupation ? [d.occupation] : null,
+  };
+}
+
+function bucketAge(age: string): string {
+  const n = parseInt(age);
+  if (isNaN(n)) return "unknown";
+  if (n <= 24) return "18-24";
+  if (n <= 34) return "25-34";
+  if (n <= 44) return "35-44";
+  if (n <= 54) return "45-54";
+  if (n <= 64) return "55-64";
+  return "65+";
+}
+
 bot.command("start", (ctx) => {
   ctx.reply(
     "👋 I'm Ad Audit Bot. Forward me any ad — a screenshot or a link — " +
@@ -84,55 +172,42 @@ bot.command("history", async (ctx) => {
 
 bot.command("summary", async (ctx) => {
   const chatId = ctx.chat.id;
+
   const { data, error } = await supabase
-    .from("ad_audits")
-    .select("detected_brand, targeting_type, inferred_interests")
+    .from("user_ad_profile")
+    .select("*")
     .eq("telegram_user_id", chatId)
-    .order("created_at", { ascending: false })
-    .limit(200);
+    .maybeSingle();
 
   if (error) {
     console.error("summary query error:", error);
     await ctx.reply("Couldn't build your summary right now.");
     return;
   }
-  if (!data || data.length === 0) {
+  if (!data) {
     await ctx.reply("No ads analyzed yet — forward me a screenshot or link to get started.");
     return;
   }
 
-  const topBrands = topN(data.map((r) => r.detected_brand).filter(Boolean), 3);
-  const targetingCounts = countBy(data.map((r) => r.targeting_type).filter(Boolean));
-  const topTargeting = Object.entries(targetingCounts).sort((a, b) => b[1] - a[1])[0];
-  const allInterests = data.flatMap((r) => r.inferred_interests ?? []);
-  const topInterests = topN(allInterests, 6);
+  const topInterests = data.top_interests
+    ? Object.entries(data.top_interests)
+        .sort((a, b) => (b[1] as number) - (a[1] as number))
+        .slice(0, 6)
+        .map(([item]) => item as string)
+    : [];
 
   const summaryText =
-    `📊 Your ad profile (${data.length} ad${data.length === 1 ? "" : "s"} tracked)\n\n` +
-    `Top brands: ${topBrands.join(", ") || "none detected"}\n` +
-    `Most common targeting: ${topTargeting ? `${topTargeting[0]} (${topTargeting[1]} of ${data.length})` : "n/a"}\n` +
+    `📊 Your ad profile (${data.total_ads} ad${data.total_ads === 1 ? "" : "s"} tracked)\n\n` +
+    `Top brands: ${escapeMarkdownV2(data.top_brand ?? "none detected")}\n` +
+    `Most common targeting: ${data.top_targeting_category ?? "n/a"}\n` +
+    (data.no_metadata_count > 0
+      ? `⚠️ ${data.no_metadata_count} ad(s) had no retrievable metadata (URL-only, no screenshot).\n`
+      : "") +
     `Recurring interest themes: ${topInterests.join(", ") || "none detected"}\n\n` +
     `Note: this reflects what the model inferred from ad creative/metadata, not the advertiser's actual targeting settings.`;
 
   await ctx.reply(summaryText);
 });
-
-function countBy(items: Array<string | null | undefined>) {
-  const counts: Record<string, number> = {};
-  for (const item of items) {
-    if (!item) continue;
-    counts[item] = (counts[item] ?? 0) + 1;
-  }
-  return counts;
-}
-
-function topN(items: Array<string | null | undefined>, n: number) {
-  const counts = countBy(items);
-  return Object.entries(counts)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, n)
-    .map(([item]) => item);
-}
 
 bot.on("message:text", (ctx) => {
   const chatId = ctx.chat.id;
@@ -190,6 +265,7 @@ async function handleScreenshot(fileId: string, chatId: number, updateId: number
       mediaType: "screenshot",
       mediaUrl: storagePath,
       analysis,
+      metadataConfidence: "full",
       forwardedFrom,
     });
   } catch (err) {
@@ -206,8 +282,18 @@ async function handleUrl(text: string, chatId: number, updateId: number, ctx: an
       return;
     }
 
-    const metadata = await fetchOgMetadata(url);
-    const analysis = await analyzeText(url, metadata);
+    // Fetch OG metadata and Jina markdown in parallel — Jina gives the
+    // model real page text, not just meta tags.
+    const [metadata, pageContent] = await Promise.all([
+      fetchOgMetadata(url),
+      fetchJinaMarkdown(url),
+    ]);
+
+    const hasOgMetadata = !!(metadata.title || metadata.description || metadata.image);
+    const hasContent = hasOgMetadata || !!pageContent;
+    const confidence: "full" | "none" = hasContent ? "full" : "none";
+
+    const analysis = await analyzeText(url, metadata, pageContent, hasContent);
 
     await saveAndReply({
       chatId,
@@ -215,6 +301,7 @@ async function handleUrl(text: string, chatId: number, updateId: number, ctx: an
       mediaType: "url",
       mediaUrl: url,
       analysis,
+      metadataConfidence: confidence,
       forwardedFrom,
     });
   } catch (err) {
@@ -226,6 +313,27 @@ async function handleUrl(text: string, chatId: number, updateId: number, ctx: an
 function extractUrl(text: string) {
   const match = text.match(/https?:\/\/\S+/);
   return match ? match[0] : null;
+}
+
+async function fetchJinaMarkdown(url: string): Promise<string | null> {
+  const JINA_API_KEY = Deno.env.get("JINA_API_KEY");
+  if (!JINA_API_KEY) return null;
+  try {
+    const res = await fetch("https://r.jina.ai/", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${JINA_API_KEY}`,
+        "Content-Type": "application/json",
+        "Accept": "text/markdown",
+      },
+      body: JSON.stringify({ url }),
+    });
+    if (!res.ok) return null;
+    return await res.text();
+  } catch (err) {
+    console.error("fetchJinaMarkdown failed:", err);
+    return null;
+  }
 }
 
 async function fetchOgMetadata(url: string) {
@@ -261,12 +369,21 @@ async function analyzeImage(base64Image: string, caption: string | null) {
   ]);
 }
 
-async function analyzeText(url: string, metadata: Record<string, unknown>) {
+async function analyzeText(
+  url: string,
+  metadata: Record<string, unknown>,
+  pageContent: string | null,
+  contentAvailable: boolean,
+) {
+  const content = contentAvailable
+    ? `Analyze this ad landing page.\nURL: ${url}\nOG Metadata: ${JSON.stringify(metadata)}\n` +
+      (pageContent ? `Page Content (markdown):\n${pageContent}` : "")
+    : `No metadata or page content could be retrieved from this URL. ` +
+      `Do NOT hallucinate a brand or targeting type. Return null for brand and targeting_type, ` +
+      `empty array for interests, and in likely_reason, state that no content could be retrieved ` +
+      `and the inference is unreliable.`;
   return callMistral([
-    {
-      type: "text",
-      text: `Analyze this ad landing page.\nURL: ${url}\nMetadata: ${JSON.stringify(metadata)}`,
-    },
+    { type: "text", text: content },
   ]);
 }
 
@@ -283,7 +400,14 @@ async function callMistral(userContent: Array<{ type: string; text?: string; ima
         { role: "system", content: ANALYSIS_SCHEMA_PROMPT },
         { role: "user", content: userContent },
       ],
-      response_format: { type: "json_object" },
+      response_format: {
+        type: "json_schema",
+        json_schema: {
+          schema: ANALYSIS_RESPONSE_SCHEMA,
+          name: "ad_analysis",
+          strict: true,
+        },
+      },
     }),
   });
 
@@ -296,7 +420,7 @@ async function callMistral(userContent: Array<{ type: string; text?: string; ima
   try {
     return JSON.parse(raw);
   } catch {
-    return { brand: null, targeting_type: null, interests: [], demographics: {}, likely_reason: raw };
+    return { brand: null, targeting_type: null, interests: [], demographics: {}, likely_reason: `Malformed response: ${raw}`.slice(0, 500) };
   }
 }
 
@@ -306,6 +430,7 @@ async function saveAndReply({
   mediaType,
   mediaUrl,
   analysis,
+  metadataConfidence,
   forwardedFrom,
 }: {
   chatId: number;
@@ -313,17 +438,24 @@ async function saveAndReply({
   mediaType: string;
   mediaUrl: string;
   analysis: any;
+  metadataConfidence: "full" | "partial" | "none";
   forwardedFrom: string | null;
 }) {
+  const normalizedInterests = normalizeInterests(analysis.interests ?? []);
+  const targetingCategory = normalizeTargetingType(analysis.targeting_type);
+  const normalizedDemographics = normalizeDemographics(analysis.demographics ?? {});
+
   const { error } = await supabase.from("ad_audits").insert({
     telegram_user_id: chatId,
     telegram_update_id: updateId,
     media_type: mediaType,
     media_url: mediaUrl,
     detected_brand: analysis.brand,
-    inferred_demographics: analysis.demographics ?? {},
-    inferred_interests: analysis.interests ?? [],
+    inferred_demographics: normalizedDemographics,
+    inferred_interests: normalizedInterests,
     targeting_type: analysis.targeting_type,
+    targeting_category: targetingCategory,
+    metadata_confidence: metadataConfidence,
     raw_ai_analysis: analysis,
     forwarded_from: forwardedFrom,
   });
@@ -332,20 +464,25 @@ async function saveAndReply({
     console.error("DB insert error:", error);
   }
 
+  const confidenceNote = metadataConfidence === "none"
+    ? "\n\n⚠️ No metadata was retrievable from this URL. Brand/interests may be unreliable."
+    : "";
+
   const text =
     `*Ad Breakdown*\n\n` +
     `*Brand:* ${escapeMarkdownV2(analysis.brand ?? "Unknown")}\n` +
     `*Targeting type:* ${escapeMarkdownV2(analysis.targeting_type ?? "N/A")}\n` +
     `*Interests:* ${escapeMarkdownV2((analysis.interests ?? []).join(", ") || "None detected")}\n` +
-    `*Demographics:* ${escapeMarkdownV2(JSON.stringify(analysis.demographics ?? {}))}\n\n` +
+    `*Demographics:* ${escapeMarkdownV2(JSON.stringify(analysis.demographics ?? {}))}\n` +
+    `*Metadata confidence:* ${escapeMarkdownV2(metadataConfidence)}\n\n` +
     `*Why you're likely seeing this:*\n` +
-    `${escapeMarkdownV2(analysis.likely_reason ?? "Not enough signal to infer a specific reason.")}`;
+    `${escapeMarkdownV2(analysis.likely_reason ?? "Not enough signal to infer a specific reason.")}` +
+    confidenceNote;
 
   try {
     await bot.api.sendMessage(chatId, text, { parse_mode: "MarkdownV2" });
   } catch (err) {
     console.error("sendMessage formatting error, falling back to plain text:", err);
-    // Last-resort fallback: strip all formatting rather than fail silently
     await bot.api.sendMessage(chatId, text.replace(/[*_[\]()~`>#+\-=|{}.!\\]/g, ""));
   }
 }
