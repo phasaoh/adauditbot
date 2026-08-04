@@ -1,0 +1,7 @@
+{
+  "imports": {
+    "@supabase/functions-js": "jsr:@supabase/functions-js@^2",
+    "@supabase/supabase-js": "npm:@supabase/supabase-js@2",
+    "grammy": "https://deno.land/x/grammy@v1.44.0/mod.ts"
+  }
+}

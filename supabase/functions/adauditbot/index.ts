@@ -1,5 +1,7 @@
-import { Bot, webhookCallback } from "https://deno.land/x/grammy@v1.44.0/mod.ts";
-import { createClient } from "npm:@supabase/supabase-js@2";
+// Setup type definitions for built-in Supabase Runtime APIs
+import "@supabase/functions-js/edge-runtime.d.ts";
+import { Bot, webhookCallback } from "grammy";
+import { createClient } from "@supabase/supabase-js";
 
 const BOT_TOKEN = Deno.env.get("TELEGRAM_BOT_TOKEN");
 const MISTRAL_API_KEY = Deno.env.get("MISTRAL_API_KEY");
@@ -8,9 +10,21 @@ const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is unset");
 if (!MISTRAL_API_KEY) throw new Error("MISTRAL_API_KEY is unset");
+if (!SUPABASE_URL || !SERVICE_ROLE_KEY) throw new Error("Supabase env vars are unset");
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
 const bot = new Bot(BOT_TOKEN);
+
+const ANALYSIS_SCHEMA_PROMPT = `You are an ad transparency analyst. Given an
+ad screenshot or ad landing page content, respond with ONLY a JSON object,
+no markdown, no prose, matching exactly:
+{
+  "brand": string | null,
+  "targeting_type": string | null,
+  "interests": string[],
+  "demographics": object,
+  "summary": string
+}`;
 
 bot.command("start", (ctx) => {
   ctx.reply(
@@ -90,13 +104,16 @@ bot.command("summary", async (ctx) => {
   await ctx.reply(summaryText);
 });
 
-function countBy(items) {
-  const counts = {};
-  for (const item of items) counts[item] = (counts[item] ?? 0) + 1;
+function countBy(items: Array<string | null | undefined>) {
+  const counts: Record<string, number> = {};
+  for (const item of items) {
+    if (!item) continue;
+    counts[item] = (counts[item] ?? 0) + 1;
+  }
   return counts;
 }
 
-function topN(items, n) {
+function topN(items: Array<string | null | undefined>, n: number) {
   const counts = countBy(items);
   return Object.entries(counts)
     .sort((a, b) => b[1] - a[1])
@@ -104,40 +121,34 @@ function topN(items, n) {
     .map(([item]) => item);
 }
 
-const ANALYSIS_SCHEMA_PROMPT = `You are an ad transparency analyst. Given an
-ad screenshot or ad landing page content, respond with ONLY a JSON object,
-no markdown, no prose, matching exactly:
-{
-  "brand": string | null,
-  "targeting_type": string | null,
-  "interests": string[],
-  "demographics": object,
-  "summary": string
-}`;
-
-bot.on("message:text", async (ctx) => {
+bot.on("message:text", (ctx) => {
   const chatId = ctx.chat.id;
   const updateId = ctx.update.update_id;
   const forwardedFrom = getForwardSource(ctx.message);
   ctx.reply("Got it, analyzing...").catch(() => {});
-  EdgeRuntime.waitUntil(handleUrl(ctx.message.text.trim(), chatId, updateId, ctx, forwardedFrom));
+  scheduleBackground(handleUrl(ctx.message.text.trim(), chatId, updateId, ctx, forwardedFrom));
 });
 
-bot.on("message:photo", async (ctx) => {
+bot.on("message:photo", (ctx) => {
   const chatId = ctx.chat.id;
   const updateId = ctx.update.update_id;
   const photo = ctx.message.photo[ctx.message.photo.length - 1];
   const caption = ctx.message.caption ?? null;
   const forwardedFrom = getForwardSource(ctx.message);
   ctx.reply("Got it, analyzing...").catch(() => {});
-  EdgeRuntime.waitUntil(
-    handleScreenshot(photo.file_id, chatId, updateId, ctx, caption, forwardedFrom)
-  );
+  scheduleBackground(handleScreenshot(photo.file_id, chatId, updateId, ctx, caption, forwardedFrom));
 });
 
-// A caption may contain the original link (common when forwarding a photo
-// post) — pull it out so it can ride along as extra context for the model.
-function getForwardSource(message) {
+function scheduleBackground(promise: Promise<unknown>) {
+  const edgeRuntime = (globalThis as { EdgeRuntime?: { waitUntil: (task: Promise<unknown>) => void } }).EdgeRuntime;
+  if (edgeRuntime?.waitUntil) {
+    edgeRuntime.waitUntil(promise);
+  } else {
+    void promise;
+  }
+}
+
+function getForwardSource(message: any) {
   const origin = message.forward_origin;
   if (!origin) return null;
   if (origin.type === "channel") return origin.chat?.title ?? "channel";
@@ -147,7 +158,7 @@ function getForwardSource(message) {
   return null;
 }
 
-async function handleScreenshot(fileId, chatId, updateId, ctx, caption, forwardedFrom) {
+async function handleScreenshot(fileId: string, chatId: number, updateId: number, ctx: any, caption: string | null, forwardedFrom: string | null) {
   try {
     const file = await ctx.api.getFile(fileId);
     const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
@@ -155,9 +166,7 @@ async function handleScreenshot(fileId, chatId, updateId, ctx, caption, forwarde
     const imageBuffer = new Uint8Array(await imageRes.arrayBuffer());
 
     const storagePath = `${chatId}/${crypto.randomUUID()}.jpg`;
-    await supabase.storage
-      .from("ad-screenshots")
-      .upload(storagePath, imageBuffer, { contentType: "image/jpeg" });
+    await supabase.storage.from("ad-screenshots").upload(storagePath, imageBuffer, { contentType: "image/jpeg" });
 
     const base64Image = encodeBase64(imageBuffer);
     const analysis = await analyzeImage(base64Image, caption);
@@ -176,7 +185,7 @@ async function handleScreenshot(fileId, chatId, updateId, ctx, caption, forwarde
   }
 }
 
-async function handleUrl(text, chatId, updateId, ctx, forwardedFrom) {
+async function handleUrl(text: string, chatId: number, updateId: number, ctx: any, forwardedFrom: string | null) {
   try {
     const url = extractUrl(text);
     if (!url) {
@@ -201,19 +210,19 @@ async function handleUrl(text, chatId, updateId, ctx, forwardedFrom) {
   }
 }
 
-function extractUrl(text) {
+function extractUrl(text: string) {
   const match = text.match(/https?:\/\/\S+/);
   return match ? match[0] : null;
 }
 
-async function fetchOgMetadata(url) {
+async function fetchOgMetadata(url: string) {
   try {
     const res = await fetch(url, {
       headers: { "User-Agent": "Mozilla/5.0 (compatible; AdAuditBot/1.0)" },
-      redirect: "follow", // ad links are often redirect/tracking chains
+      redirect: "follow",
     });
     const html = await res.text();
-    const pick = (prop) => {
+    const pick = (prop: string) => {
       const m = html.match(new RegExp(`<meta[^>]+property=["']${prop}["'][^>]+content=["']([^"']+)["']`, "i"));
       return m ? m[1] : null;
     };
@@ -225,13 +234,11 @@ async function fetchOgMetadata(url) {
     };
   } catch (err) {
     console.error("fetchOgMetadata failed:", err);
-    // Some sites block fetches or render everything client-side (e.g. X,
-    // Instagram). Fall back to letting the model reason from the bare URL.
     return { resolved_url: url, title: null, description: null, image: null };
   }
 }
 
-async function analyzeImage(base64Image, caption) {
+async function analyzeImage(base64Image: string, caption: string | null) {
   const text = caption
     ? `Analyze this ad screenshot. It was sent with this caption, which may contain the original link or extra context: "${caption}"`
     : "Analyze this ad screenshot.";
@@ -241,7 +248,7 @@ async function analyzeImage(base64Image, caption) {
   ]);
 }
 
-async function analyzeText(url, metadata) {
+async function analyzeText(url: string, metadata: Record<string, unknown>) {
   return callMistral([
     {
       type: "text",
@@ -250,7 +257,7 @@ async function analyzeText(url, metadata) {
   ]);
 }
 
-async function callMistral(userContent) {
+async function callMistral(userContent: Array<{ type: string; text?: string; image_url?: string }>) {
   const res = await fetch("https://api.mistral.ai/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -258,7 +265,7 @@ async function callMistral(userContent) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "pixtral-large-latest", // verify current model name in Mistral console
+      model: "pixtral-large-latest",
       messages: [
         { role: "system", content: ANALYSIS_SCHEMA_PROMPT },
         { role: "user", content: userContent },
@@ -280,7 +287,21 @@ async function callMistral(userContent) {
   }
 }
 
-async function saveAndReply({ chatId, updateId, mediaType, mediaUrl, analysis, forwardedFrom }) {
+async function saveAndReply({
+  chatId,
+  updateId,
+  mediaType,
+  mediaUrl,
+  analysis,
+  forwardedFrom,
+}: {
+  chatId: number;
+  updateId: number;
+  mediaType: string;
+  mediaUrl: string;
+  analysis: any;
+  forwardedFrom: string | null;
+}) {
   const { error } = await supabase.from("ad_audits").insert({
     telegram_user_id: chatId,
     telegram_update_id: updateId,
@@ -295,7 +316,6 @@ async function saveAndReply({ chatId, updateId, mediaType, mediaUrl, analysis, f
   });
 
   if (error && error.code !== "23505") {
-    // 23505 = unique_violation (duplicate update_id, already processed)
     console.error("DB insert error:", error);
   }
 
@@ -310,7 +330,7 @@ async function saveAndReply({ chatId, updateId, mediaType, mediaUrl, analysis, f
   await bot.api.sendMessage(chatId, text, { parse_mode: "Markdown" });
 }
 
-function encodeBase64(bytes) {
+function encodeBase64(bytes: Uint8Array) {
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary);

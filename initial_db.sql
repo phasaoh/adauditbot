@@ -40,4 +40,5 @@ on conflict (id) do nothing;
 
 -- No storage.objects policies for anon/authenticated: only the
 -- service_role (used by the Edge Function) can read/write this bucket.
-alter table storage.objects enable row level security;
+-- (storage.objects has RLS enabled by default on all Supabase projects —
+-- no need to alter it yourself, and you don't have owner privileges to.)
