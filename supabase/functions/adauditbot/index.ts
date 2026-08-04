@@ -1,5 +1,5 @@
 // Setup type definitions for built-in Supabase Runtime APIs
-import "@supabase/functions-js/edge-runtime.d.ts";
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { Bot, webhookCallback } from "grammy";
 import { createClient } from "@supabase/supabase-js";
 
@@ -15,16 +15,29 @@ if (!SUPABASE_URL || !SERVICE_ROLE_KEY) throw new Error("Supabase env vars are u
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
 const bot = new Bot(BOT_TOKEN);
 
-const ANALYSIS_SCHEMA_PROMPT = `You are an ad transparency analyst. Given an
-ad screenshot or ad landing page content, respond with ONLY a JSON object,
-no markdown, no prose, matching exactly:
+const ANALYSIS_SCHEMA_PROMPT = `You are an ad transparency analyst. Your job
+is to help the person understand WHY they were likely shown this specific
+ad, not to describe what the ad is advertising.
+
+Given an ad screenshot or ad landing page content, respond with ONLY a JSON
+object, no markdown, no prose, matching exactly:
 {
   "brand": string | null,
   "targeting_type": string | null,
   "interests": string[],
   "demographics": object,
-  "summary": string
-}`;
+  "likely_reason": string
+}
+
+For "likely_reason": write 2-3 sentences addressed directly to the person
+(use "you"), explaining the most probable reason THEY were targeted with
+this ad — e.g. inferred interest signals, demographic bracket, browsing/app
+behavior, platform-specific targeting norms (e.g. lookalike audiences,
+retargeting, broad vs. narrow interest targeting). Do NOT summarize the
+ad's marketing copy or what the product does — assume the person can already
+read the ad. Focus entirely on the targeting inference itself. If the
+targeting looks broad/undifferentiated rather than personal, say so plainly
+rather than inventing a narrower reason.`;
 
 bot.command("start", (ctx) => {
   ctx.reply(
@@ -265,7 +278,7 @@ async function callMistral(userContent: Array<{ type: string; text?: string; ima
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "pixtral-large-latest",
+      model: "mistral-large-latest", // pixtral-large-latest is deprecated; mistral-large-latest is vision-capable
       messages: [
         { role: "system", content: ANALYSIS_SCHEMA_PROMPT },
         { role: "user", content: userContent },
@@ -283,7 +296,7 @@ async function callMistral(userContent: Array<{ type: string; text?: string; ima
   try {
     return JSON.parse(raw);
   } catch {
-    return { brand: null, targeting_type: null, interests: [], demographics: {}, summary: raw };
+    return { brand: null, targeting_type: null, interests: [], demographics: {}, likely_reason: raw };
   }
 }
 
@@ -321,13 +334,27 @@ async function saveAndReply({
 
   const text =
     `*Ad Breakdown*\n\n` +
-    `*Brand:* ${analysis.brand ?? "Unknown"}\n` +
-    `*Targeting type:* ${analysis.targeting_type ?? "N/A"}\n` +
-    `*Interests:* ${(analysis.interests ?? []).join(", ") || "None detected"}\n` +
-    `*Demographics:* ${JSON.stringify(analysis.demographics ?? {})}\n\n` +
-    `${analysis.summary ?? ""}`;
+    `*Brand:* ${escapeMarkdownV2(analysis.brand ?? "Unknown")}\n` +
+    `*Targeting type:* ${escapeMarkdownV2(analysis.targeting_type ?? "N/A")}\n` +
+    `*Interests:* ${escapeMarkdownV2((analysis.interests ?? []).join(", ") || "None detected")}\n` +
+    `*Demographics:* ${escapeMarkdownV2(JSON.stringify(analysis.demographics ?? {}))}\n\n` +
+    `*Why you're likely seeing this:*\n` +
+    `${escapeMarkdownV2(analysis.likely_reason ?? "Not enough signal to infer a specific reason.")}`;
 
-  await bot.api.sendMessage(chatId, text, { parse_mode: "Markdown" });
+  try {
+    await bot.api.sendMessage(chatId, text, { parse_mode: "MarkdownV2" });
+  } catch (err) {
+    console.error("sendMessage formatting error, falling back to plain text:", err);
+    // Last-resort fallback: strip all formatting rather than fail silently
+    await bot.api.sendMessage(chatId, text.replace(/[*_[\]()~`>#+\-=|{}.!\\]/g, ""));
+  }
+}
+
+// Escapes MarkdownV2 special characters in model-generated text so Telegram
+// doesn't choke on stray underscores, asterisks, parens, etc. See:
+// https://core.telegram.org/bots/api#markdownv2-style
+function escapeMarkdownV2(text: string) {
+  return text.replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, "\\$&");
 }
 
 function encodeBase64(bytes: Uint8Array) {
