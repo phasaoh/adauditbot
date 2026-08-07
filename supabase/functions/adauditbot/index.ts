@@ -127,6 +127,60 @@ function bucketAge(age: string): string {
   return "65+";
 }
 
+const PLATFORM_OPT_OUT: Record<string, { name: string; steps: string }> = {
+  "facebook.com": {
+    name: "Facebook",
+    steps: "Settings & privacy → Ads → Ad preferences → remove interest",
+  },
+  "instagram.com": {
+    name: "Instagram",
+    steps: "Settings → Ads → Ad topics → adjust interests",
+  },
+  "tiktok.com": {
+    name: "TikTok",
+    steps: "Settings & privacy → Ads → 'Based on your interactions' → adjust",
+  },
+  "x.com": {
+    name: "X/Twitter",
+    steps: "Settings & privacy → Privacy and safety → Ads preferences → turn off",
+  },
+"linkedin.com": {
+    name: "LinkedIn",
+    steps: "Settings → Data privacy → Ad preferences → manage",
+  },
+  "youtube.com": {
+    name: "YouTube",
+    steps: "Settings → Privacy → Ad settings → turn off Ad personalization",
+  },
+  "google.com": {
+    name: "Google",
+    steps: "myadcenter.google.com → turn off ad personalization",
+  },
+};
+
+function detectPlatform(url: string): { name: string; steps: string } | null {
+  try {
+    const host = new URL(url).hostname.replace(/^www\./, "");
+    for (const [domain, info] of Object.entries(PLATFORM_OPT_OUT)) {
+      if (host === domain || host.endsWith("." + domain)) {
+        return info;
+      }
+    }
+  } catch {
+    // ignore invalid URLs
+  }
+  return null;
+}
+
+function getOptOutTip(url: string | null): string {
+  const platform = url ? detectPlatform(url) : null;
+  if (!platform) return "";
+
+  return "\n\n🔧 To reduce similar " + platform.name + " ads:\n" +
+    "• " + platform.steps + "\n" +
+    "• Or hide this ad: long-press → Hide ad";
+}
+
 function formatDemographics(d: Record<string, unknown>): string {
   const parts: string[] = [];
   if (d.age_bracket) parts.push(`Age ${d.age_bracket}`);
@@ -139,6 +193,75 @@ function formatDemographics(d: Record<string, unknown>): string {
   return parts.length > 0 ? parts.join(" · ") : "No demographic data";
 }
 
+bot.command("about", (ctx) => {
+  ctx.reply(
+    "ℹ️ *About Ad Audit Bot*\n\n" +
+    "I analyze ads you forward and explain the *likely targeting signals* behind them — inferred interests, demographics, and platform norms.\n\n" +
+    "I do *not*:\n" +
+    "• Contact advertisers or platforms on your behalf\n" +
+    "• Remove, block, or report ads\n" +
+    "• Access your full ad profile on any platform\n\n" +
+    "Data stored per ad: brand, targeting inference, demographics, timestamp.\n" +
+    "Use /clear to delete everything, /delete <#> to remove one entry.\n\n" +
+    "Built to help you understand *why* you see ads, not to stop them.",
+    { parse_mode: "MarkdownV2" }
+  );
+});
+
+bot.command("delete", async (ctx) => {
+  const chatId = ctx.chat.id;
+  const args = ctx.message.text.trim().split(/\s+/);
+  const index = parseInt(args[1]);
+
+  if (isNaN(index) || index < 1) {
+    await ctx.reply("Usage: /delete <#>\nExample: /delete 2");
+    return;
+  }
+
+  const { data, error } = await supabase
+    .from("ad_audits")
+    .select("id, detected_brand")
+    .eq("telegram_user_id", chatId)
+    .order("created_at", { ascending: false })
+    .range(index - 1, index - 1);
+
+  if (error || !data || data.length === 0) {
+    await ctx.reply("⚠️ Entry not found. Use /history to see your entries.");
+    return;
+  }
+
+  const entry = data[0];
+  const { error: deleteError } = await supabase
+    .from("ad_audits")
+    .delete()
+    .eq("id", entry.id);
+
+  if (deleteError) {
+    console.error("delete entry error:", deleteError);
+    await ctx.reply("⚠️ Couldn't delete that entry right now.");
+    return;
+  }
+
+  await ctx.reply("✅ Entry #" + index + " (" + (entry.detected_brand ?? "Unknown") + ") deleted.");
+});
+
+bot.command("clear", async (ctx) => {
+  const chatId = ctx.chat.id;
+
+  const { error } = await supabase
+    .from("ad_audits")
+    .delete()
+    .eq("telegram_user_id", chatId);
+
+  if (error) {
+    console.error("clear error:", error);
+    await ctx.reply("⚠️ Couldn't clear your data right now.");
+    return;
+  }
+
+  await ctx.reply("🗑️ All your data has been deleted.");
+});
+
 bot.command("start", (ctx) => {
   ctx.reply(
     "👋 I'm Ad Audit Bot. Forward me any ad — a screenshot or a link — " +
@@ -146,7 +269,9 @@ bot.command("start", (ctx) => {
       "interests/demographics behind it.\n\n" +
       "Commands:\n" +
       "/history — 📋 see your last analyzed ads\n" +
-      "/summary — 📊 a short profile of what you're being targeted with"
+      "/summary — 📊 a short profile of what you're being targeted with\n" +
+      "/about — ℹ️ what this bot does and doesn't do\n" +
+      "/clear — 🗑️ delete all your data\n" 
   );
 });
 
@@ -480,6 +605,8 @@ async function saveAndReply({
     ? "\n\n⚠️ No metadata was retrievable from this URL. Brand/interests may be unreliable."
     : "";
 
+  const optOutTip = getOptOutTip(mediaUrl);
+
   const text =
     `🔍 *Ad Breakdown*\n\n` +
     `🏷️ *Brand:* ${escapeMarkdownV2(analysis.brand ?? "Unknown")}\n` +
@@ -489,7 +616,8 @@ async function saveAndReply({
     `⚡ *Metadata confidence:* ${escapeMarkdownV2(metadataConfidence)}\n\n` +
     `💡 *Why you're likely seeing this:*\n` +
     `${escapeMarkdownV2(analysis.likely_reason ?? "Not enough signal to infer a specific reason.")}` +
-    confidenceNote;
+    confidenceNote +
+    escapeMarkdownV2(optOutTip);
 
   try {
     await bot.api.sendMessage(chatId, text, { parse_mode: "MarkdownV2" });
