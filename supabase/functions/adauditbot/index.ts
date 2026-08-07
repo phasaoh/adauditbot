@@ -127,14 +127,26 @@ function bucketAge(age: string): string {
   return "65+";
 }
 
+function formatDemographics(d: Record<string, unknown>): string {
+  const parts: string[] = [];
+  if (d.age_bracket) parts.push(`Age ${d.age_bracket}`);
+  if (d.gender && d.gender !== "all") parts.push(`Gender ${d.gender}`);
+  if (d.location && d.location !== "unknown") parts.push(`Location ${d.location}`);
+  if (d.income_level && d.income_level !== "unknown") parts.push(`Income ${d.income_level}`);
+  if (d.occupation && Array.isArray(d.occupation) && d.occupation.length > 0) {
+    parts.push(`Occupation ${d.occupation.join(", ")}`);
+  }
+  return parts.length > 0 ? parts.join(" · ") : "No demographic data";
+}
+
 bot.command("start", (ctx) => {
   ctx.reply(
     "👋 I'm Ad Audit Bot. Forward me any ad — a screenshot or a link — " +
       "and I'll break down the brand, likely targeting, and inferred " +
       "interests/demographics behind it.\n\n" +
       "Commands:\n" +
-      "/history — see your last analyzed ads\n" +
-      "/summary — a short profile of what you're being targeted with"
+      "/history — 📋 see your last analyzed ads\n" +
+      "/summary — 📊 a short profile of what you're being targeted with"
   );
 });
 
@@ -149,11 +161,11 @@ bot.command("history", async (ctx) => {
 
   if (error) {
     console.error("history query error:", error);
-    await ctx.reply("Couldn't load your history right now.");
+    await ctx.reply("⚠️ Couldn't load your history right now.");
     return;
   }
   if (!data || data.length === 0) {
-    await ctx.reply("No ads analyzed yet — forward me a screenshot or link to get started.");
+    await ctx.reply("📭 No ads analyzed yet — forward me a screenshot or link to get started.");
     return;
   }
 
@@ -164,7 +176,7 @@ bot.command("history", async (ctx) => {
       hour: "2-digit",
       minute: "2-digit",
     });
-    return `${i + 1}. ${date} — ${row.detected_brand ?? "Unknown"} — ${row.media_type} — ${row.targeting_type ?? "n/a"}`;
+    return `🔹 ${i + 1}. ${date} — ${row.detected_brand ?? "Unknown"} — ${row.media_type} — ${row.targeting_type ?? "n/a"}`;
   });
 
   await ctx.reply(`📋 Your last ${data.length} ads:\n\n${lines.join("\n")}`);
@@ -181,11 +193,11 @@ bot.command("summary", async (ctx) => {
 
   if (error) {
     console.error("summary query error:", error);
-    await ctx.reply("Couldn't build your summary right now.");
+    await ctx.reply("⚠️ Couldn't build your summary right now.");
     return;
   }
   if (!data) {
-    await ctx.reply("No ads analyzed yet — forward me a screenshot or link to get started.");
+    await ctx.reply("📭 No ads analyzed yet — forward me a screenshot or link to get started.");
     return;
   }
 
@@ -198,13 +210,13 @@ bot.command("summary", async (ctx) => {
 
   const summaryText =
     `📊 Your ad profile (${data.total_ads} ad${data.total_ads === 1 ? "" : "s"} tracked)\n\n` +
-    `Top brands: ${escapeMarkdownV2(data.top_brand ?? "none detected")}\n` +
-    `Most common targeting: ${data.top_targeting_category ?? "n/a"}\n` +
+    `🏢 Top brands: ${escapeMarkdownV2(data.top_brand ?? "none detected")}\n` +
+    `🎯 Most common targeting: ${data.top_targeting_category ?? "n/a"}\n` +
     (data.no_metadata_count > 0
       ? `⚠️ ${data.no_metadata_count} ad(s) had no retrievable metadata (URL-only, no screenshot).\n`
       : "") +
-    `Recurring interest themes: ${topInterests.join(", ") || "none detected"}\n\n` +
-    `Note: this reflects what the model inferred from ad creative/metadata, not the advertiser's actual targeting settings.`;
+    `🧲 Recurring interest themes: ${topInterests.join(", ") || "none detected"}\n\n` +
+    `📝 Note: this reflects what the model inferred from ad creative/metadata, not the advertiser's actual targeting settings.`;
 
   await ctx.reply(summaryText);
 });
@@ -213,7 +225,7 @@ bot.on("message:text", (ctx) => {
   const chatId = ctx.chat.id;
   const updateId = ctx.update.update_id;
   const forwardedFrom = getForwardSource(ctx.message);
-  ctx.reply("Got it, analyzing...").catch(() => {});
+  ctx.reply("🔍 Got it, analyzing...").catch(() => {});
   scheduleBackground(handleUrl(ctx.message.text.trim(), chatId, updateId, ctx, forwardedFrom));
 });
 
@@ -223,7 +235,7 @@ bot.on("message:photo", (ctx) => {
   const photo = ctx.message.photo[ctx.message.photo.length - 1];
   const caption = ctx.message.caption ?? null;
   const forwardedFrom = getForwardSource(ctx.message);
-  ctx.reply("Got it, analyzing...").catch(() => {});
+  ctx.reply("🔍 Got it, analyzing...").catch(() => {});
   scheduleBackground(handleScreenshot(photo.file_id, chatId, updateId, ctx, caption, forwardedFrom));
 });
 
@@ -270,7 +282,7 @@ async function handleScreenshot(fileId: string, chatId: number, updateId: number
     });
   } catch (err) {
     console.error("handleScreenshot error:", err);
-    await bot.api.sendMessage(chatId, "Sorry, something went wrong processing that screenshot.");
+    await bot.api.sendMessage(chatId, "😬 Sorry, something went wrong processing that screenshot.");
   }
 }
 
@@ -278,7 +290,7 @@ async function handleUrl(text: string, chatId: number, updateId: number, ctx: an
   try {
     const url = extractUrl(text);
     if (!url) {
-      await bot.api.sendMessage(chatId, "Send a link or a screenshot of an ad.");
+      await bot.api.sendMessage(chatId, "📎 Send a link or a screenshot of an ad.");
       return;
     }
 
@@ -306,7 +318,7 @@ async function handleUrl(text: string, chatId: number, updateId: number, ctx: an
     });
   } catch (err) {
     console.error("handleUrl error:", err);
-    await bot.api.sendMessage(chatId, "Sorry, something went wrong processing that link.");
+    await bot.api.sendMessage(chatId, "😬 Sorry, something went wrong processing that link.");
   }
 }
 
@@ -420,7 +432,7 @@ async function callMistral(userContent: Array<{ type: string; text?: string; ima
   try {
     return JSON.parse(raw);
   } catch {
-    return { brand: null, targeting_type: null, interests: [], demographics: {}, likely_reason: `Malformed response: ${raw}`.slice(0, 500) };
+    return { brand: null, targeting_type: null, interests: [], demographics: {}, likely_reason: `⚠️ Malformed response: ${raw}`.slice(0, 500) };
   }
 }
 
@@ -469,13 +481,13 @@ async function saveAndReply({
     : "";
 
   const text =
-    `*Ad Breakdown*\n\n` +
-    `*Brand:* ${escapeMarkdownV2(analysis.brand ?? "Unknown")}\n` +
-    `*Targeting type:* ${escapeMarkdownV2(analysis.targeting_type ?? "N/A")}\n` +
-    `*Interests:* ${escapeMarkdownV2((analysis.interests ?? []).join(", ") || "None detected")}\n` +
-    `*Demographics:* ${escapeMarkdownV2(JSON.stringify(analysis.demographics ?? {}))}\n` +
-    `*Metadata confidence:* ${escapeMarkdownV2(metadataConfidence)}\n\n` +
-    `*Why you're likely seeing this:*\n` +
+    `🔍 *Ad Breakdown*\n\n` +
+    `🏷️ *Brand:* ${escapeMarkdownV2(analysis.brand ?? "Unknown")}\n` +
+    `🎯 *Targeting type:* ${escapeMarkdownV2(analysis.targeting_type ?? "N/A")}\n` +
+    `🧲 *Interests:* ${escapeMarkdownV2((analysis.interests ?? []).join(", ") || "None detected")}\n` +
+    `👥 *Demographics:* ${escapeMarkdownV2(formatDemographics(analysis.demographics ?? {}))}\n` +
+    `⚡ *Metadata confidence:* ${escapeMarkdownV2(metadataConfidence)}\n\n` +
+    `💡 *Why you're likely seeing this:*\n` +
     `${escapeMarkdownV2(analysis.likely_reason ?? "Not enough signal to infer a specific reason.")}` +
     confidenceNote;
 
